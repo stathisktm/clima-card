@@ -1,6 +1,6 @@
 /*! Clima Card — compact A/C card for Home Assistant · MIT · github.com/stathisktm/clima-card */
 
-const CLIMA_VERSION = "2.0.0";
+const CLIMA_VERSION = "2.1.0";
 
 const CLIMA_DEFAULTS = {
   title: "A/C",
@@ -24,6 +24,8 @@ const CLIMA_DEFAULTS = {
 
   show_fan_speed: true,
   show_power_consumption: true,
+  show_runtime_today: false,
+  show_runtime_month: false,
 
   color_cool: "#2196f3",
   color_heat: "#f44336",
@@ -42,9 +44,10 @@ const CLIMA_MODES = [
   { mode: "heat_cool", show: "show_mode_auto", label: "AUTO", color: "color_auto", alt: "auto" },
 ];
 
+// Written in capitals already: CSS uppercase keeps the Greek accents ("ΨΎΧΕΙ").
 const CLIMA_ACTION = {
-  cooling: "ψύχει", heating: "ζεσταίνει", drying: "αφυγραίνει", fan: "ανεμιστήρας",
-  idle: "αναμονή", off: "", preheating: "προθέρμανση", defrosting: "ξεπάγωμα",
+  cooling: "ΨΥΧΕΙ", heating: "ΖΕΣΤΑΙΝΕΙ", drying: "ΑΦΥΓΡΑΙΝΕΙ", fan: "ΑΝΕΜΙΣΤΗΡΑΣ",
+  idle: "ΑΝΑΜΟΝΗ", off: "", preheating: "ΠΡΟΘΕΡΜΑΝΣΗ", defrosting: "ΞΕΠΑΓΩΜΑ",
 };
 
 const CLIMA_FAN = {
@@ -75,6 +78,45 @@ function climaMigrate(config) {
   return cfg;
 }
 
+/* =========================
+   RUNTIME (today / month)
+   =========================
+   From the climate entity's own recorded history — no extra sensor. History only goes back as far
+   as the recorder keeps it (often 5-10 days), so finished days are also written to a small ledger
+   in HA's per-user frontend storage: the month adds up those days, filling any gaps from history
+   whenever the card is open. */
+
+const CLIMA_LEDGER_KEY = "clima-card-runtime";
+const CLIMA_IDLE = ["off", "unavailable", "unknown"];
+
+const climaDayKey = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+
+function climaDuration(seconds) {
+  const m = Math.floor(Math.max(0, seconds) / 60);
+  if (m < 60) return `${m}′`;
+  const h = Math.floor(m / 60);
+  return h >= 100 ? `${h}ω` : `${h}ω ${String(m % 60).padStart(2, "0")}′`;
+}
+
+/** Seconds "on" per local day, from compressed history rows [{s, lc|lu}] (ascending). */
+function climaPerDay(rows, nowMs) {
+  const out = {};
+  for (let i = 0; i < rows.length; i++) {
+    if (CLIMA_IDLE.includes(rows[i].s)) continue;
+    let a = rows[i].t;
+    const b = i + 1 < rows.length ? rows[i + 1].t : nowMs;
+    while (a < b) {
+      const d = new Date(a);
+      const next = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1).getTime();
+      const end = Math.min(b, next);
+      const key = climaDayKey(d);
+      out[key] = (out[key] || 0) + (end - a) / 1000;
+      a = end;
+    }
+  }
+  return out;
+}
+
 class ClimaCard extends HTMLElement {
   constructor() {
     super();
@@ -83,6 +125,8 @@ class ClimaCard extends HTMLElement {
     this._hass = null;
     this._pendingTemp = null;
     this._tempTimer = null;
+    this._runtime = null;
+    this._runtimeAt = 0;
   }
 
   static getConfigElement() {
@@ -104,6 +148,14 @@ class ClimaCard extends HTMLElement {
     this._hass = hass;
     if (!this.shadowRoot.querySelector("ha-card")) this._render();
     this._updateState();
+  }
+
+  connectedCallback() {
+    this._runtimeTick = setInterval(() => this._renderRuntime(), 60000);
+  }
+
+  disconnectedCallback() {
+    clearInterval(this._runtimeTick);
   }
 
   getCardSize() {
@@ -145,7 +197,7 @@ class ClimaCard extends HTMLElement {
         .subtitle { font-size: 9px; line-height: 10px; opacity: .58; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex-shrink: 1; }
         .action {
           font-size: 8px; line-height: 14px; padding: 0 6px; border-radius: 7px; white-space: nowrap;
-          background: rgba(255,255,255,.14); text-transform: uppercase; letter-spacing: .3px;
+          background: rgba(255,255,255,.14); letter-spacing: .3px;
         }
 
         /* POWER BUTTON */
@@ -280,6 +332,8 @@ class ClimaCard extends HTMLElement {
             <div id="powerStat" class="stat hidden" data-entity="entity_power_consumption"><ha-icon icon="mdi:flash"></ha-icon><span id="powerValue" class="stat-value">--</span></div>
             <div id="ecoStat" class="stat hidden" data-entity="entity_eco"><ha-icon icon="mdi:leaf"></ha-icon><span id="ecoValue" class="stat-value">Eco</span></div>
             <div id="timerStat" class="stat hidden" data-entity="entity_timer"><ha-icon icon="mdi:timer-outline"></ha-icon><span id="timerValue" class="stat-value">--</span></div>
+            <div id="todayStat" class="stat hidden" title="Λειτουργία σήμερα"><ha-icon icon="mdi:clock-outline"></ha-icon><span id="todayValue" class="stat-value">--</span></div>
+            <div id="monthStat" class="stat hidden" title="Λειτουργία αυτόν τον μήνα"><ha-icon icon="mdi:calendar-month-outline"></ha-icon><span id="monthValue" class="stat-value">--</span></div>
             <div class="spacer"></div>
             <div id="fanControl" class="fan-control" role="button" tabindex="0" title="Ταχύτητα ανεμιστήρα">
               <ha-icon id="fanIcon" icon="mdi:fan"></ha-icon><span id="fanLabel" class="fan-label"></span>
@@ -574,6 +628,115 @@ class ClimaCard extends HTMLElement {
 
     const timer = this._getEntityState(cfg.entity_timer);
     this._updateStat("#timerStat", "#timerValue", timer ? this._formatTimer(timer) : "--", !!timer);
+
+    this._loadRuntime(climate);
+    this._renderRuntime();
+  }
+
+  /** Refreshes the history (at most every 5 minutes, or right after the A/C switches state). */
+  async _loadRuntime(climate) {
+    const cfg = this._config;
+    if (!cfg.show_runtime_today && !cfg.show_runtime_month) return;
+    if (!this._hass?.callWS || this._runtimeLoading) return;
+    const changed = this._runtimeState !== climate.state || this._runtimeEntity !== cfg.entity_climate;
+    if (!changed && Date.now() - this._runtimeAt < 300000) return;
+    this._runtimeState = climate.state;
+    this._runtimeEntity = cfg.entity_climate;
+    this._runtimeLoading = true;
+    this._runtimeAt = Date.now();
+    try {
+      const now = new Date();
+      const start = cfg.show_runtime_month
+        ? new Date(now.getFullYear(), now.getMonth(), 1)
+        : new Date(now.getFullYear(), now.getMonth(), now.getDate());
+      const res = await this._hass.callWS({
+        type: "history/history_during_period",
+        start_time: start.toISOString(),
+        entity_ids: [cfg.entity_climate],
+        minimal_response: true,
+        no_attributes: true,
+      });
+      const rows = (res?.[cfg.entity_climate] || [])
+        .map((r) => ({ s: r.s ?? r.state, t: ((r.lc ?? r.lu) * 1000) || new Date(r.last_changed || r.last_updated).getTime() }))
+        .filter((r) => Number.isFinite(r.t))
+        .sort((a, b) => a.t - b.t);
+      // History begins at the start time only if the recorder still has it; else at its first row.
+      const coveredFrom = rows.length ? Math.max(rows[0].t, start.getTime()) : Date.now();
+      if (rows.length) rows[0].t = coveredFrom;
+      const perDay = climaPerDay(rows, Date.now());
+
+      const ledger = cfg.show_runtime_month ? await this._readLedger() : {};
+      const mine = { ...(ledger[cfg.entity_climate] || {}) };
+      let dirty = false;
+      const today = climaDayKey(now);
+      // Finished days fully inside the covered history are exact: write them to the ledger.
+      for (let d = new Date(start); d < new Date(now.getFullYear(), now.getMonth(), now.getDate()); d.setDate(d.getDate() + 1)) {
+        if (d.getTime() < coveredFrom) continue;
+        const key = climaDayKey(d);
+        const value = Math.round(perDay[key] || 0);
+        if (mine[key] !== value) { mine[key] = value; dirty = true; }
+      }
+      if (cfg.show_runtime_month && dirty) await this._writeLedger(ledger, cfg.entity_climate, mine);
+
+      const monthPrefix = today.slice(0, 7);
+      let monthDays = 0, knownDays = 0;
+      Object.entries(mine).forEach(([k, v]) => { if (k.startsWith(monthPrefix) && k !== today) { monthDays += v; knownDays++; } });
+      this._runtime = {
+        rows, todayKey: today,
+        todayBase: perDay[today] || 0,
+        monthDays,
+        // Every day before today should be in the ledger; missing ones make the month a lower bound.
+        monthPartial: knownDays < now.getDate() - 1,
+        at: Date.now(),
+        on: !CLIMA_IDLE.includes(climate.state),
+      };
+    } catch (e) {
+      console.warn("clima-card runtime:", e);
+    } finally {
+      this._runtimeLoading = false;
+      this._renderRuntime();
+    }
+  }
+
+  async _readLedger() {
+    try {
+      const r = await this._hass.callWS({ type: "frontend/get_user_data", key: CLIMA_LEDGER_KEY });
+      return r?.value && typeof r.value === "object" ? r.value : {};
+    } catch (e) {
+      return {};
+    }
+  }
+
+  async _writeLedger(ledger, entityId, days) {
+    // Keep about two months per A/C.
+    const cutoff = climaDayKey(new Date(Date.now() - 62 * 86400000));
+    const pruned = Object.fromEntries(Object.entries(days).filter(([k]) => k >= cutoff));
+    try {
+      // Re-read right before writing, so cards for other A/Cs saving at the same time aren't lost.
+      const fresh = await this._readLedger();
+      await this._hass.callWS({ type: "frontend/set_user_data", key: CLIMA_LEDGER_KEY, value: { ...ledger, ...fresh, [entityId]: pruned } });
+    } catch (e) {
+      console.warn("clima-card runtime ledger:", e);
+    }
+  }
+
+  _renderRuntime() {
+    const root = this.shadowRoot;
+    const cfg = this._config;
+    if (!root?.querySelector("#todayStat")) return;
+    const r = this._runtime;
+    // While running, the open stretch keeps growing between history refreshes.
+    const live = r && r.on && climaDayKey(new Date()) === r.todayKey ? (Date.now() - r.at) / 1000 : 0;
+    const today = r ? r.todayBase + live : null;
+    this._updateStat("#todayStat", "#todayValue", today === null ? "--" : climaDuration(today), !!cfg.show_runtime_today);
+    const month = r ? r.monthDays + (today || 0) : null;
+    this._updateStat("#monthStat", "#monthValue", month === null ? "--" : `${r.monthPartial ? "≥" : ""}${climaDuration(month)}`, !!cfg.show_runtime_month);
+    const monthStat = root.querySelector("#monthStat");
+    if (monthStat) {
+      monthStat.title = r?.monthPartial
+        ? "Λειτουργία αυτόν τον μήνα — λείπουν κάποιες μέρες από το ιστορικό, η τιμή είναι τουλάχιστον τόση"
+        : "Λειτουργία αυτόν τον μήνα";
+    }
   }
 
   _applyThemeAndBackground(state) {
@@ -598,6 +761,7 @@ const CLIMA_LABELS = {
   entity_outside_temp: "Εξωτερική θερμοκρασία", entity_power_consumption: "Κατανάλωση", entity_eco: "Eco", entity_timer: "Χρονοδιακόπτης",
   show_mode_cool: "Ψύξη", show_mode_heat: "Θέρμανση", show_mode_fan: "Ανεμιστήρας", show_mode_dry: "Αφύγρανση",
   show_mode_auto: "Auto", show_fan_speed: "Κουμπί ανεμιστήρα", show_power_consumption: "Κατανάλωση",
+  show_runtime_today: "Ώρες λειτουργίας σήμερα", show_runtime_month: "Ώρες λειτουργίας μήνα",
   color_cool: "Ψύξη", color_heat: "Θέρμανση", color_dry: "Αφύγρανση", color_fan: "Ανεμιστήρας", color_auto: "Auto", color_off: "Σβηστό",
 };
 
@@ -622,7 +786,7 @@ const CLIMA_SCHEMA = [
   {
     type: "expandable", title: "Εμφάνιση", icon: "mdi:eye-outline",
     schema: [
-      { type: "grid", name: "", schema: ["show_mode_cool", "show_mode_heat", "show_mode_fan", "show_mode_dry", "show_mode_auto", "show_fan_speed", "show_power_consumption"].map((name) => ({ name, selector: { boolean: {} } })) },
+      { type: "grid", name: "", schema: ["show_mode_cool", "show_mode_heat", "show_mode_fan", "show_mode_dry", "show_mode_auto", "show_fan_speed", "show_power_consumption", "show_runtime_today", "show_runtime_month"].map((name) => ({ name, selector: { boolean: {} } })) },
       { name: "theme", selector: { select: { mode: "dropdown", options: [
         { value: "", label: "Κανένα" },
         { value: "ios-dark-mode", label: "iOS dark" },
